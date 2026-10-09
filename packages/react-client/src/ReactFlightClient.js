@@ -45,8 +45,8 @@ import type {TemporaryReferenceSet} from './ReactFlightTemporaryReferences';
 import {
   enableProfilerTimer,
   enableComponentPerformanceTrack,
-  enableAsyncDebugInfo,
   enableFlightWeakThenables,
+  enableFlightObjectReferences,
 } from 'shared/ReactFeatureFlags';
 
 import {
@@ -69,6 +69,7 @@ import {
 import {
   createBoundServerReference,
   registerBoundServerReference,
+  createServerObjectReference,
 } from './ReactFlightReplyClient';
 
 import {readTemporaryReference} from './ReactFlightTemporaryReferences';
@@ -299,7 +300,7 @@ function reactPromiseThen<T>(
       initializeModuleChunk(chunk);
       break;
   }
-  if (__DEV__ && enableAsyncDebugInfo) {
+  if (__DEV__) {
     // Because only native Promises get picked up when we're awaiting we need to wrap
     // this in a native Promise in DEV. This means that these callbacks are no longer sync
     // but the lazy initialization is still sync and the .value can be inspected after,
@@ -2226,6 +2227,28 @@ function loadServerReference<A: Iterable<any>, T>(
   return null as any;
 }
 
+function loadServerObjectReference(
+  response: Response,
+  metaData: {id: any, $$reference?: Object},
+  parentObject: Object,
+  key: string,
+): mixed {
+  // A Server Reference to an object is always opaque on the client, even if
+  // we have a module mapping for Server References: unlike a function
+  // reference, the module that produced it is only meant to be evaluated in a
+  // true server environment. The reference can only be passed back to the
+  // server, where it resolves to the object.
+  // The server reuses this metadata when the same object occurs again.
+  // Cache its handle so reference equality is preserved within this response.
+  const existingReference = metaData.$$reference;
+  if (existingReference !== undefined) {
+    return existingReference;
+  }
+  const reference = createServerObjectReference(metaData.id);
+  metaData.$$reference = reference;
+  return reference;
+}
+
 function resolveLazy(value: any): mixed {
   while (
     typeof value === 'object' &&
@@ -2718,6 +2741,20 @@ function parseModelString(
           loadServerReference,
         );
       }
+      case 'H': {
+        if (enableFlightObjectReferences) {
+          // Server Reference to an object
+          const ref = value.slice(2);
+          return getOutlinedModel(
+            response,
+            ref,
+            parentObject,
+            key,
+            loadServerObjectReference,
+          );
+        }
+        return undefined;
+      }
       case 'T': {
         // Temporary Reference
         const reference = '$' + value.slice(2);
@@ -2990,7 +3027,8 @@ function ResponseInstance(
   this._encodeFormAction = encodeFormAction;
   this._nonce = nonce;
   this._chunks = chunks;
-  this._stringDecoder = createStringDecoder();
+  // Preserve a leading U+FEFF instead of consuming it as an encoding signature.
+  this._stringDecoder = createStringDecoder(true);
   this._closed = false;
   this._closedReason = null;
   this._allowPartialStream = allowPartialStream;
@@ -3035,18 +3073,16 @@ function ResponseInstance(
         '"use ' + rootEnv.toLowerCase() + '"',
       );
     }
-    if (enableAsyncDebugInfo) {
-      // Track the start of the fetch to the best of our knowledge.
-      // Note: createFromFetch allows this to be marked at the start of the fetch
-      // where as if you use createFromReadableStream from the body of the fetch
-      // then the start time is when the headers resolved.
-      this._debugStartTime =
-        debugStartTime == null ? performance.now() : debugStartTime;
-      this._debugIOStarted = false;
-      // We consider everything before the first setTimeout task to be cached data
-      // and is not considered I/O required to load the stream.
-      setTimeout(markIOStarted.bind(this), 0);
-    }
+    // Track the start of the fetch to the best of our knowledge.
+    // Note: createFromFetch allows this to be marked at the start of the fetch
+    // where as if you use createFromReadableStream from the body of the fetch
+    // then the start time is when the headers resolved.
+    this._debugStartTime =
+      debugStartTime == null ? performance.now() : debugStartTime;
+    this._debugIOStarted = false;
+    // We consider everything before the first setTimeout task to be cached data
+    // and is not considered I/O required to load the stream.
+    setTimeout(markIOStarted.bind(this), 0);
     this._debugEndTime = debugEndTime === undefined ? null : debugEndTime;
     this._debugFindSourceMapURL = findSourceMapURL;
     this._debugChannel = debugChannel;
@@ -3142,7 +3178,7 @@ export function createStreamState(
     _rowLength: 0,
     _buffer: [],
   } as Omit<StreamState, '_debugInfo' | '_debugTargetChunkSize'> as any;
-  if (__DEV__ && enableAsyncDebugInfo) {
+  if (__DEV__) {
     const response = unwrapWeakResponse(weakResponse);
     // Create an entry for the I/O to load the stream itself.
     const debugValuePromise = Promise.resolve(streamDebugValue);
@@ -3177,7 +3213,7 @@ function incrementChunkDebugInfo(
   streamState: StreamState,
   chunkLength: number,
 ): void {
-  if (__DEV__ && enableAsyncDebugInfo) {
+  if (__DEV__) {
     const debugInfo: ReactIOInfo = streamState._debugInfo;
     const endTime = performance.now();
     const previousEndTime = debugInfo.end;
@@ -3245,7 +3281,7 @@ function resolveChunkDebugInfo(
   streamState: StreamState,
   chunk: SomeChunk<any>,
 ): void {
-  if (__DEV__ && enableAsyncDebugInfo) {
+  if (__DEV__) {
     // Only include stream information after a macrotask. Any chunk processed
     // before that is considered cached data.
     if (response._debugIOStarted) {
@@ -5212,10 +5248,7 @@ function processFullStringRow(
       return;
     }
     case 78 /* "N" */: {
-      if (
-        enableProfilerTimer &&
-        (enableComponentPerformanceTrack || enableAsyncDebugInfo)
-      ) {
+      if (enableProfilerTimer) {
         // Track the time origin for future debug info. We track it relative
         // to the current environment's time space.
         const timeOrigin: number = +row;
@@ -5235,7 +5268,7 @@ function processFullStringRow(
       // Fallthrough to share the error with Console entries.
     }
     case 74 /* "J" */: {
-      if (enableProfilerTimer && enableAsyncDebugInfo) {
+      if (enableProfilerTimer) {
         resolveIOInfo(response, id, row);
         return;
       }
